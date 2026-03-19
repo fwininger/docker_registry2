@@ -54,7 +54,7 @@ run_tests() {
 
 TASK=$1
 NETNAME=registry-test
-IMG=ruby:3.1.1-alpine
+IMG=ruby:3.4.9-alpine
 
 case $TASK in
 testonly)

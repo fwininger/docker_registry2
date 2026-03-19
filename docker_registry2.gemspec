@@ -24,6 +24,8 @@ Gem::Specification.new do |spec|
   spec.executables   = spec.files.grep(%r{^bin/}) { |f| File.basename(f) }
   spec.require_paths = ['lib']
 
+  spec.add_development_dependency 'base64'
+  spec.add_development_dependency 'benchmark'
   spec.add_development_dependency 'bundler'
   spec.add_development_dependency 'rake', '~> 13.0'
   spec.add_development_dependency 'rspec', '~> 3'
@@ -31,6 +33,8 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency 'vcr', '~> 6'
   spec.add_development_dependency 'webmock'
 
-  spec.add_dependency 'rest-client', '>= 1.8.0'
+  spec.add_dependency 'faraday', '>= 2.0'
+  spec.add_dependency 'faraday-follow_redirects'
+  spec.add_dependency 'faraday-net_http'
   spec.metadata['rubygems_mfa_required'] = 'true'
 end

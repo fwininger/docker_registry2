@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'tmpdir'
+require 'openssl'
 require_relative '../lib/docker_registry2'
 
 RSpec.describe DockerRegistry2 do
@@ -80,6 +82,42 @@ RSpec.describe DockerRegistry2 do
 
       it { expect { my_ubuntu_multiarch_manifest }.not_to raise_error }
       it { expect(archs).to match_array(%w[amd64 arm64]) }
+    end
+
+    it 'retries manifest requests with the legacy Docker accept header after a 500 response' do
+      manifest_url = 'http://localhost:5000/v2/hello-world-v1/manifests/latest'
+      manifest_body = {
+        'schemaVersion' => 1,
+        'name' => 'hello-world-v1',
+        'tag' => 'latest',
+        'fsLayers' => [{ 'blobSum' => 'sha256:abc123' }]
+      }.to_json
+      modern_accept = [
+        'application/vnd.docker.distribution.manifest.v2+json',
+        'application/vnd.docker.distribution.manifest.list.v2+json',
+        'application/vnd.oci.image.manifest.v1+json',
+        'application/vnd.oci.image.index.v1+json',
+        'application/json'
+      ].join(',')
+      legacy_accept = [
+        'application/vnd.docker.distribution.manifest.v2+json',
+        'application/vnd.docker.distribution.manifest.list.v2+json',
+        'application/vnd.docker.distribution.manifest.v1+prettyjws',
+        'application/json'
+      ].join(',')
+
+      stub_request(:get, manifest_url)
+        .with(headers: { 'Accept' => modern_accept })
+        .to_return(status: 500, body: 'registry error')
+      stub_request(:get, manifest_url)
+        .with(headers: { 'Accept' => legacy_accept })
+        .to_return(status: 200, body: manifest_body, headers: { 'Content-Type' => 'application/json' })
+
+      manifest = VCR.turned_off { connected_object.manifest('hello-world-v1', 'latest') }
+
+      expect(manifest['schemaVersion']).to eq(1)
+      expect(a_request(:get, manifest_url).with(headers: { 'Accept' => modern_accept })).to have_been_made.once
+      expect(a_request(:get, manifest_url).with(headers: { 'Accept' => legacy_accept })).to have_been_made.once
     end
 
     context 'Docker registry without path' do
@@ -171,6 +209,225 @@ RSpec.describe DockerRegistry2 do
                                     '17.04', 'arm64', 'windows')
           end.to raise_error(DockerRegistry2::NotFound, 'No matches found for the image=my-ubuntu tag=17.04 os=windows architecture=arm64')
         end
+      end
+    end
+  end
+
+  describe '#blob' do
+    let(:uri) { 'https://registry.example.com' }
+    let(:registry) { DockerRegistry2::Registry.new(uri, user: 'me', password: 'secret') }
+    let(:blob_url) { "#{uri}/v2/private/repo/blobs/sha256:abc123" }
+    let(:auth_header) { "Basic #{Base64.strict_encode64('me:secret')}" }
+
+    it 'does not write the unauthenticated challenge body into streamed blob files' do
+      stub_request(:get, blob_url)
+        .to_return(
+          status: 401,
+          body: 'auth required',
+          headers: { 'WWW-Authenticate' => 'Basic realm="Registry"' }
+        ).then
+        .to_return(
+          status: 200,
+          body: 'real blob data',
+          headers: { 'Content-Length' => '14' }
+        )
+
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, 'blob.bin')
+
+        registry.blob('private/repo', 'sha256:abc123', path)
+
+        expect(File.binread(path)).to eq('real blob data')
+      end
+
+      expect(a_request(:get, blob_url).with(headers: { 'Authorization' => auth_header })).to have_been_made.once
+    end
+
+    it 'follows redirected blob downloads' do
+      redirected_url = 'https://storage.example.com/downloads/sha256:abc123'
+
+      stub_request(:get, blob_url)
+        .to_return(status: 307, headers: { 'Location' => redirected_url })
+      stub_request(:get, redirected_url)
+        .to_return(status: 200, body: 'redirected blob data')
+
+      blob = VCR.turned_off { registry.blob('private/repo', 'sha256:abc123') }
+
+      expect(blob.body).to eq('redirected blob data')
+    end
+
+    it 'drops authorization on cross-host redirects' do
+      redirected_url = 'https://canonical.example.com/downloads/sha256:abc123'
+
+      stub_request(:get, blob_url)
+        .to_return(
+          status: 401,
+          body: 'auth required',
+          headers: { 'WWW-Authenticate' => 'Basic realm="Registry"' }
+        ).then
+        .to_return(status: 307, headers: { 'Location' => redirected_url })
+      stub_request(:get, blob_url)
+        .with(headers: { 'Authorization' => auth_header })
+        .to_return(status: 307, headers: { 'Location' => redirected_url })
+      stub_request(:get, redirected_url)
+        .to_return(status: 200, body: 'redirected blob data')
+
+      blob = VCR.turned_off { registry.blob('private/repo', 'sha256:abc123') }
+
+      expect(blob.body).to eq('redirected blob data')
+      expect(a_request(:get, redirected_url).with(headers: { 'Authorization' => auth_header })).not_to have_been_made
+    end
+  end
+
+  describe '#tag' do
+    let(:uri) { 'https://registry.example.com' }
+    let(:registry) { DockerRegistry2::Registry.new(uri) }
+    let(:manifest_url) { "#{uri}/v2/source/repo/manifests/latest" }
+    let(:redirected_tag_url) { 'https://canonical.example.com/v2/destination/repo/manifests/release' }
+    let(:tag_url) { "#{uri}/v2/destination/repo/manifests/release" }
+    let(:manifest_body) { { 'schemaVersion' => 2, 'config' => { 'digest' => 'sha256:abc123' } }.to_json }
+
+    it 'preserves PUT when following redirects for tag writes' do
+      stub_request(:get, manifest_url)
+        .to_return(status: 200, body: manifest_body, headers: { 'Content-Type' => 'application/json' })
+
+      stub_request(:put, tag_url)
+        .to_return(status: 301, headers: { 'Location' => redirected_tag_url })
+
+      stub_request(:put, redirected_tag_url)
+        .with(body: manifest_body)
+        .to_return(status: 201, body: '')
+
+      registry.tag('source/repo', 'latest', 'destination/repo', 'release')
+
+      expect(a_request(:put, redirected_tag_url).with(body: manifest_body)).to have_been_made.once
+      expect(a_request(:get, redirected_tag_url)).not_to have_been_made
+    end
+  end
+
+  describe 'unexpected HTTP errors' do
+    let(:uri) { 'https://registry.example.com' }
+    let(:registry) { DockerRegistry2::Registry.new(uri) }
+
+    it 'raises for server errors instead of parsing the response body' do
+      stub_request(:get, "#{uri}/v2/_catalog")
+        .to_return(status: 500, body: 'upstream error')
+
+      expect { registry.search('hello-world') }
+        .to raise_error(DockerRegistry2::RegistryHTTPException, 'Registry request failed with status 500')
+    end
+
+    it 'raises for rate-limited tag requests' do
+      stub_request(:get, "#{uri}/v2/private/repo/tags/list")
+        .to_return(status: 429, body: 'slow down')
+
+      expect { registry.tags('private/repo') }
+        .to raise_error(DockerRegistry2::RegistryHTTPException, 'Registry request failed with status 429')
+    end
+  end
+
+  describe 'http_options compatibility' do
+    let(:tls_version) { 'TLSv1_2' }
+
+    let(:registry) do
+      DockerRegistry2::Registry.new(
+        'https://registry.example.com',
+        open_timeout: 2,
+        read_timeout: 5,
+        http_options: {
+          'proxy' => 'http://proxy.example.com:8080',
+          'headers' => { 'X-Test' => '1' },
+          'params' => { 'ns' => 'team' },
+          'verify_ssl' => false,
+          'ssl_version' => tls_version,
+          'ssl_ca_file' => '/tmp/ca.pem',
+          'ssl_ca_path' => '/tmp/certs',
+          'ssl_cert_store' => 'custom-store',
+          'request' => { 'timeout' => 15 }
+        }
+      )
+    end
+
+    it 'preserves caller-supplied Faraday connection options' do
+      options = registry.send(:connection_options)
+
+      expect(options[:proxy]).to eq('http://proxy.example.com:8080')
+      expect(options[:headers]).to eq('X-Test' => '1')
+      expect(options[:params]).to eq('ns' => 'team')
+    end
+
+    it 'maps legacy top-level ssl options into Faraday ssl settings' do
+      options = registry.send(:connection_options)
+
+      expect(options[:ssl]).to include(
+        verify: false,
+        version: tls_version,
+        ca_file: '/tmp/ca.pem',
+        ca_path: '/tmp/certs',
+        cert_store: 'custom-store'
+      )
+    end
+
+    it 'maps numeric verify_ssl modes to verify_mode instead of boolean verify' do
+      numeric_verify_registry = DockerRegistry2::Registry.new(
+        'https://registry.example.com',
+        http_options: { 'verify_ssl' => OpenSSL::SSL::VERIFY_NONE }
+      )
+
+      options = numeric_verify_registry.send(:connection_options)
+
+      expect(options[:ssl]).to include(verify_mode: OpenSSL::SSL::VERIFY_NONE)
+      expect(options[:ssl]).not_to have_key(:verify)
+    end
+
+    it 'merges request timeouts without discarding caller request options' do
+      options = registry.send(:connection_options)
+
+      expect(options[:request]).to include(timeout: 15, open_timeout: 2)
+    end
+
+    it 'preserves string-keyed timeout overrides from http_options' do
+      string_timeout_registry = DockerRegistry2::Registry.new(
+        'https://registry.example.com',
+        http_options: { 'open_timeout' => 10, 'read_timeout' => 20 }
+      )
+
+      options = string_timeout_registry.send(:connection_options)
+
+      expect(options[:request]).to include(open_timeout: 10, timeout: 20)
+    end
+
+    it 'loads legacy mTLS file paths into OpenSSL objects' do
+      key = OpenSSL::PKey::RSA.new(2048)
+      name = OpenSSL::X509::Name.parse('/CN=registry.example.com')
+      cert = OpenSSL::X509::Certificate.new
+      cert.version = 2
+      cert.serial = 1
+      cert.subject = name
+      cert.issuer = name
+      cert.public_key = key.public_key
+      cert.not_before = Time.now
+      cert.not_after = Time.now + 3600
+      cert.sign(key, OpenSSL::Digest.new('SHA256'))
+
+      Dir.mktmpdir do |dir|
+        cert_path = File.join(dir, 'client.crt')
+        key_path = File.join(dir, 'client.key')
+        File.write(cert_path, cert.to_pem)
+        File.write(key_path, key.to_pem)
+
+        mtls_registry = DockerRegistry2::Registry.new(
+          'https://registry.example.com',
+          http_options: {
+            'ssl_client_cert' => cert_path,
+            'ssl_client_key' => key_path
+          }
+        )
+
+        options = mtls_registry.send(:connection_options)
+
+        expect(options[:ssl][:client_cert]).to be_a(OpenSSL::X509::Certificate)
+        expect(options[:ssl][:client_key]).to be_a(OpenSSL::PKey::RSA)
       end
     end
   end

@@ -1,10 +1,16 @@
 # frozen_string_literal: true
 
 require 'fileutils'
-require 'rest-client'
+require 'base64'
+require 'faraday'
+require 'faraday/follow_redirects'
+require 'faraday/net_http'
 require 'json'
+require 'openssl'
 
 module DockerRegistry2
+  Response = Struct.new(:body, :headers, :code, :request_url, keyword_init: true)
+
   class Registry # rubocop:disable Metrics/ClassLength
     # @param [#to_s] base_uri Docker registry base URI
     # @param [Hash] options Client options
@@ -14,21 +20,21 @@ module DockerRegistry2
     #                                       It is ignored if http_options[:open_timeout] is also specified.
     # @option options [#to_s] :read_timeout Time to wait for data from a registry.
     #                                       It is ignored if http_options[:read_timeout] is also specified.
-    # @option options [Hash] :http_options Extra options for RestClient::Request.execute.
+    # @option options [Hash] :http_options Extra options for Faraday connection/request setup.
     def initialize(uri, options = {})
       @uri = URI.parse(uri)
-      @base_uri = +"#{@uri.scheme}://#{@uri.host}:#{@uri.port}#{@uri.path}"
+      @base_uri = "#{@uri.scheme}://#{@uri.host}:#{@uri.port}#{@uri.path}"
       # `URI.join("https://example.com/foo/bar", "v2")` drops `bar` in the base URL. A trailing slash prevents that.
       @base_uri << '/' unless @base_uri.end_with? '/'
       @user = options[:user]
       @password = options[:password]
       @http_options = options[:http_options] || {}
-      @http_options[:open_timeout] ||= options[:open_timeout] || 2
-      @http_options[:read_timeout] ||= options[:read_timeout] || 5
+      apply_timeout_defaults(options)
+      @connection = nil
     end
 
-    def doget(url)
-      doreq 'get', url
+    def doget(url, accept: nil)
+      doreq 'get', url, nil, nil, accept: accept
     end
 
     def doput(url, payload = nil)
@@ -56,14 +62,14 @@ module DockerRegistry2
 
         # The next URL in the Link header may be relative to the request URL, or absolute.
         # URI.join handles both cases nicely.
-        url = URI.join(response.request.url, next_url)
+        url = URI.join(response.request_url, next_url)
       end
     end
 
     def search(query = '')
       all_repos = []
       paginate_doget('v2/_catalog') do |response|
-        repos = JSON.parse(response)['repositories']
+        repos = JSON.parse(response.body)['repositories']
         repos.select! { |repo| repo.match?(/#{query}/) } unless query.empty?
         all_repos += repos
       end
@@ -81,7 +87,7 @@ module DockerRegistry2
 
       response = doget "v2/#{repo}/tags/list#{query_vars}"
       # parse the response
-      resp = JSON.parse response
+      resp = JSON.parse response.body
       # parse out next page link if necessary
       resp['last'] = last(response.headers[:link]) if response.headers[:link]
 
@@ -108,7 +114,7 @@ module DockerRegistry2
 
     def manifest(repo, tag)
       # first get the manifest
-      response = doget "v2/#{repo}/manifests/#{tag}"
+      response = doget_with_legacy_fallback("v2/#{repo}/manifests/#{tag}")
       parsed = JSON.parse response.body
       manifest = DockerRegistry2::Manifest[parsed]
       manifest.body = response.body
@@ -276,105 +282,36 @@ module DockerRegistry2
 
     private
 
-    def doreq(type, url, stream = nil, payload = nil)
-      begin
-        block = if stream.nil?
-                  nil
-                else
-                  proc { |response|
-                    response.read_body do |chunk|
-                      stream.write chunk
-                    end
-                  }
-                end
-        response = RestClient::Request.execute(@http_options.merge(
-                                                 method: type,
-                                                 url: URI.join(@base_uri, url).to_s,
-                                                 headers: headers(payload: payload),
-                                                 block_response: block,
-                                                 payload: payload
-                                               ))
-      rescue SocketError
+    def doreq(type, url, stream = nil, payload = nil, **request_options)
+      response = perform_request(type, url, payload: payload, stream: stream, **request_options)
+      return handle_error_response(response, unauthorized_exception: DockerRegistry2::RegistryAuthenticationException) unless response.code == 401
+
+      header = response.headers[:www_authenticate]
+      method = header.to_s.downcase.split[0]
+      case method
+      when 'basic'
+        do_basic_req(type, url, stream, payload, **request_options)
+      when 'bearer'
+        do_bearer_req(type, url, header, stream: stream, payload: payload, **request_options)
+      else
         raise DockerRegistry2::RegistryUnknownException
-      rescue RestClient::NotFound
-        raise DockerRegistry2::NotFound, "Image not found at #{@uri.host}"
-      rescue RestClient::Unauthorized => e
-        header = e.response.headers[:www_authenticate]
-        method = header.to_s.downcase.split[0]
-        case method
-        when 'basic'
-          response = do_basic_req(type, url, stream, payload)
-        when 'bearer'
-          response = do_bearer_req(type, url, header, stream, payload)
-        else
-          raise DockerRegistry2::RegistryUnknownException
-        end
       end
-      response
     end
 
-    def do_basic_req(type, url, stream = nil, payload = nil)
-      begin
-        block = if stream.nil?
-                  nil
-                else
-                  proc { |response|
-                    response.read_body do |chunk|
-                      stream.write chunk
-                    end
-                  }
-                end
-        response = RestClient::Request.execute(@http_options.merge(
-                                                 method: type,
-                                                 url: URI.join(@base_uri, url).to_s,
-                                                 user: @user,
-                                                 password: @password,
-                                                 headers: headers(payload: payload),
-                                                 block_response: block,
-                                                 payload: payload
-                                               ))
-      rescue SocketError
-        raise DockerRegistry2::RegistryUnknownException
-      rescue RestClient::Unauthorized
-        raise DockerRegistry2::RegistryAuthenticationException
-      rescue RestClient::MethodNotAllowed
-        raise DockerRegistry2::InvalidMethod
-      rescue RestClient::NotFound => e
-        raise DockerRegistry2::NotFound, e
-      end
-      response
+    def do_basic_req(type, url, stream = nil, payload = nil, **request_options)
+      response = perform_request(type, url, payload: payload, stream: stream, auth: :basic, **request_options)
+      handle_error_response(response, unauthorized_exception: DockerRegistry2::RegistryAuthenticationException)
     end
 
-    def do_bearer_req(type, url, header, stream = false, payload = nil)
+    def do_bearer_req(type, url, header, request_options = {})
       token = authenticate_bearer(header)
-      begin
-        block = if stream.nil?
-                  nil
-                else
-                  proc { |response|
-                    response.read_body do |chunk|
-                      stream.write chunk
-                    end
-                  }
-                end
-        response = RestClient::Request.execute(@http_options.merge(
-                                                 method: type,
-                                                 url: URI.join(@base_uri, url).to_s,
-                                                 headers: headers(payload: payload, bearer_token: token),
-                                                 block_response: block,
-                                                 payload: payload
-                                               ))
-      rescue SocketError
-        raise DockerRegistry2::RegistryUnknownException
-      rescue RestClient::Unauthorized
-        raise DockerRegistry2::RegistryAuthenticationException
-      rescue RestClient::MethodNotAllowed
-        raise DockerRegistry2::InvalidMethod
-      rescue RestClient::NotFound => e
-        raise DockerRegistry2::NotFound, e
-      end
-
-      response
+      response = perform_request(type, url,
+                                 payload: request_options[:payload],
+                                 stream: request_options[:stream],
+                                 auth: :bearer,
+                                 bearer_token: token,
+                                 **request_options.except(:payload, :stream))
+      handle_error_response(response, unauthorized_exception: DockerRegistry2::RegistryAuthenticationException)
     end
 
     def authenticate_bearer(header)
@@ -384,26 +321,16 @@ module DockerRegistry2
       target[:params][:account] = @user if defined? @user && !@user.to_s.strip.empty?
       # authenticate against the realm
       uri = URI.parse(target[:realm])
-      begin
-        response = RestClient::Request.execute(@http_options.merge(
-                                                 method: :get,
-                                                 url: uri.to_s, headers: { params: target[:params] },
-                                                 user: @user,
-                                                 password: @password
-                                               ))
-      rescue RestClient::Unauthorized, RestClient::Forbidden
-        # bad authentication
-        raise DockerRegistry2::RegistryAuthenticationException
-      rescue RestClient::NotFound => e
-        raise DockerRegistry2::NotFound, e
-      end
+      response = perform_absolute_request(:get, uri.to_s, params: target[:params], auth: :basic)
+      handle_error_response(response,
+                            unauthorized_exception: DockerRegistry2::RegistryAuthenticationException,
+                            forbidden_exception: DockerRegistry2::RegistryAuthenticationException)
       # now save the web token
-      result = JSON.parse(response)
+      result = JSON.parse(response.body)
       result['token'] || result['access_token']
     end
 
     def split_auth_header(header = '')
-      h = {}
       h = { params: {} }
       header.scan(/(\w+)="([^"]+)"/) do |entry|
         case entry[0]
@@ -416,20 +343,213 @@ module DockerRegistry2
       h
     end
 
-    def headers(payload: nil, bearer_token: nil)
+    def headers(payload: nil, bearer_token: nil, accept: nil)
       headers = {}
       headers['Authorization'] = "Bearer #{bearer_token}" unless bearer_token.nil?
-      if payload.nil?
-        headers['Accept'] =
-          %w[application/vnd.docker.distribution.manifest.v2+json
-             application/vnd.docker.distribution.manifest.list.v2+json
-             application/vnd.oci.image.manifest.v1+json
-             application/vnd.oci.image.index.v1+json
-             application/json].join(',')
-      end
+      headers['Accept'] = accept || default_accept_header if payload.nil?
       headers['Content-Type'] = 'application/vnd.docker.distribution.manifest.v2+json' unless payload.nil?
 
       headers
+    end
+
+    def default_accept_header
+      %w[application/vnd.docker.distribution.manifest.v2+json
+         application/vnd.docker.distribution.manifest.list.v2+json
+         application/vnd.oci.image.manifest.v1+json
+         application/vnd.oci.image.index.v1+json
+         application/json].join(',')
+    end
+
+    def legacy_manifest_accept_header
+      %w[application/vnd.docker.distribution.manifest.v2+json
+         application/vnd.docker.distribution.manifest.list.v2+json
+         application/vnd.docker.distribution.manifest.v1+prettyjws
+         application/json].join(',')
+    end
+
+    def connection
+      @connection ||= build_connection(@base_uri)
+    end
+
+    def build_connection(base_url)
+      Faraday.new(base_url, **connection_options) do |faraday|
+        faraday.response :follow_redirects,
+                         limit: 5,
+                         standards_compliant: true
+        faraday.adapter :net_http
+      end
+    end
+
+    def connection_options
+      options = symbolize_keys(@http_options).dup
+      options.delete(:open_timeout)
+      options.delete(:read_timeout)
+
+      ssl = normalize_ssl_options(options)
+      request = request_options(options.delete(:request))
+
+      options[:ssl] = ssl unless ssl.empty?
+      options[:request] = request unless request.empty?
+      options
+    end
+
+    def request_options(request = nil)
+      options = symbolize_keys(request || {})
+      options[:open_timeout] ||= @http_options[:open_timeout] || @http_options['open_timeout']
+      options[:timeout] ||= @http_options[:read_timeout] || @http_options['read_timeout']
+      options
+    end
+
+    def normalize_ssl_options(options)
+      ssl = symbolize_keys(options.delete(:ssl) || {})
+      normalize_legacy_verify_ssl!(ssl, options)
+      ssl_aliases.each do |target_key, source_keys|
+        source_keys.each do |source_key|
+          next if source_key == :verify_ssl
+          next unless options.key?(source_key)
+
+          ssl[target_key] = options.delete(source_key)
+        end
+      end
+      normalize_legacy_client_cert_paths!(ssl)
+      ssl
+    end
+
+    def ssl_aliases
+      {
+        version: %i[ssl_version],
+        ca_file: %i[ca_file ssl_ca_file],
+        ca_path: %i[ca_path ssl_ca_path],
+        cert_store: %i[cert_store ssl_cert_store],
+        client_cert: %i[client_cert ssl_client_cert],
+        client_key: %i[client_key ssl_client_key],
+        verify_mode: %i[verify_mode]
+      }
+    end
+
+    def apply_timeout_defaults(options)
+      @http_options[:open_timeout] = options[:open_timeout] || 2 unless @http_options.key?(:open_timeout) || @http_options.key?('open_timeout')
+      @http_options[:read_timeout] = options[:read_timeout] || 5 unless @http_options.key?(:read_timeout) || @http_options.key?('read_timeout')
+    end
+
+    def normalize_legacy_verify_ssl!(ssl, options)
+      return unless options.key?(:verify_ssl)
+
+      verify_ssl = options.delete(:verify_ssl)
+      if verify_ssl.is_a?(Numeric)
+        ssl[:verify_mode] = verify_ssl
+      else
+        ssl[:verify] = verify_ssl
+      end
+    end
+
+    def normalize_legacy_client_cert_paths!(ssl)
+      ssl[:client_cert] = load_client_certificate(ssl[:client_cert]) if ssl[:client_cert].is_a?(String)
+      ssl[:client_key] = load_client_key(ssl[:client_key]) if ssl[:client_key].is_a?(String)
+    end
+
+    def load_client_certificate(path)
+      OpenSSL::X509::Certificate.new(File.read(path))
+    end
+
+    def load_client_key(path)
+      OpenSSL::PKey.read(File.read(path))
+    end
+
+    def symbolize_keys(hash)
+      hash.transform_keys { |key| key.respond_to?(:to_sym) ? key.to_sym : key }
+    end
+
+    def perform_request(type, url, request_options = {})
+      perform(connection, type, url, request_options)
+    end
+
+    def perform_absolute_request(type, url, request_options = {})
+      uri = URI.parse(url)
+      absolute_connection = build_connection("#{uri.scheme}://#{uri.host}:#{uri.port}")
+      request_url = uri.request_uri
+      perform(absolute_connection, type, request_url, request_options)
+    end
+
+    def perform(conn, type, url, request_options = {})
+      request_headers = headers(payload: request_options[:payload],
+                                bearer_token: request_options[:bearer_token],
+                                accept: request_options[:accept])
+      response = conn.run_request(type.to_sym, url, request_options[:payload], request_headers) do |request|
+        request.params.update(request_options[:params]) if request_options[:params]
+        request.options.on_data = stream_handler(request_options[:stream]) if request_options[:stream]
+        apply_auth!(request, request_options[:auth])
+      end
+
+      normalize_response(response, stream: request_options[:stream])
+    rescue Faraday::SSLError
+      raise DockerRegistry2::RegistrySSLException
+    rescue Faraday::TimeoutError, Faraday::ConnectionFailed, SocketError
+      raise DockerRegistry2::RegistryUnknownException
+    end
+
+    def apply_auth!(request, auth)
+      case auth
+      when :basic
+        return if @user.to_s.empty? && @password.to_s.empty?
+
+        token = Base64.strict_encode64([@user, @password].join(':'))
+        request.headers['Authorization'] = "Basic #{token}"
+      when nil, :bearer
+        nil
+      else
+        raise ArgumentError, "Unsupported auth strategy: #{auth}"
+      end
+    end
+
+    def stream_handler(stream)
+      proc do |chunk, _overall_received_bytes, env|
+        status = env.status.to_i
+        stream.write(chunk) if status >= 200 && status < 300
+      end
+    end
+
+    def normalize_response(response, stream: nil)
+      DockerRegistry2::Response.new(
+        body: stream.nil? ? response.body : nil,
+        headers: normalize_headers(response.headers),
+        code: response.status,
+        request_url: response.env.url.to_s
+      )
+    end
+
+    def normalize_headers(raw_headers)
+      headers = {}
+      raw_headers.each do |key, value|
+        normalized_key = key.to_s.tr('-', '_').downcase.to_sym
+        headers[normalized_key] = value
+      end
+      headers
+    end
+
+    def handle_error_response(response, unauthorized_exception:, forbidden_exception: nil)
+      case response.code
+      when 200..299
+        response
+      when 401
+        raise unauthorized_exception
+      when 403
+        raise(forbidden_exception || DockerRegistry2::RegistryAuthorizationException)
+      when 404
+        raise DockerRegistry2::NotFound, "Image not found at #{@uri.host}"
+      when 405
+        raise DockerRegistry2::InvalidMethod
+      else
+        raise DockerRegistry2::RegistryHTTPException, "Registry request failed with status #{response.code}"
+      end
+    end
+
+    def doget_with_legacy_fallback(url)
+      doget(url)
+    rescue DockerRegistry2::RegistryHTTPException => e
+      raise e unless e.message.include?('status 500')
+
+      doget(url, accept: legacy_manifest_accept_header)
     end
   end
 end

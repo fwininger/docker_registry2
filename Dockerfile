@@ -1,5 +1,5 @@
 # build container
-ARG IMG=ruby:3.1.1-alpine
+ARG IMG=ruby:3.4.9-alpine
 FROM ${IMG} AS build
 
 RUN apk --update add make

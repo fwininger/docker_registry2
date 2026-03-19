@@ -30,4 +30,7 @@ module DockerRegistry2
 
   class InvalidMethod < DockerRegistry2::Exception
   end
+
+  class RegistryHTTPException < DockerRegistry2::Exception
+  end
 end

@@ -3,7 +3,7 @@ version: '2.4'
 services:
   registry:
     restart: always
-    image: registry
+    image: ${REGISTRY_IMAGE:-registry:2.8.3}
     ports:
       - 5000:5000
     environment:
